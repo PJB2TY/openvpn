@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2002-2024 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -96,17 +96,7 @@ struct mroute_addr {
             uint8_t prefix[12];
             in_addr_t addr;     /* _network order_ IPv4 address */
         } v4mappedv6;
-    }
-#ifndef HAVE_ANONYMOUS_UNION_SUPPORT
-/* Wrappers to support compilers that do not grok anonymous unions */
-        mroute_union
-#define raw_addr mroute_union.raw_addr
-#define ether mroute_union.ether
-#define v4 mroute_union.v4
-#define v6 mroute_union.v6
-#define v4mappedv6 mroute_union.v4mappedv6
-#endif
-    ;
+    };
 };
 
 /* Double-check that struct packing works as expected */
@@ -177,8 +167,6 @@ unsigned int mroute_extract_addr_ip(struct mroute_addr *src,
 
 unsigned int mroute_extract_addr_ether(struct mroute_addr *src,
                                        struct mroute_addr *dest,
-                                       struct mroute_addr *esrc,
-                                       struct mroute_addr *edest,
                                        uint16_t vid,
                                        const struct buffer *buf);
 
@@ -189,8 +177,6 @@ unsigned int mroute_extract_addr_ether(struct mroute_addr *src,
 static inline unsigned int
 mroute_extract_addr_from_packet(struct mroute_addr *src,
                                 struct mroute_addr *dest,
-                                struct mroute_addr *esrc,
-                                struct mroute_addr *edest,
                                 uint16_t vid,
                                 const struct buffer *buf,
                                 int tunnel_type)
@@ -203,7 +189,7 @@ mroute_extract_addr_from_packet(struct mroute_addr *src,
     }
     else if (tunnel_type == DEV_TYPE_TAP)
     {
-        ret = mroute_extract_addr_ether(src, dest, esrc, edest, vid, buf);
+        ret = mroute_extract_addr_ether(src, dest, vid, buf);
     }
     return ret;
 }

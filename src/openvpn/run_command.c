@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2021 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2024 OpenVPN Technologies, Inc. <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -23,8 +23,6 @@
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
-#elif defined(_MSC_VER)
-#include "config-msvc.h"
 #endif
 
 #include "syshead.h"
@@ -157,6 +155,10 @@ openvpn_execve(const struct argv *a, const struct env_set *es, const unsigned in
             {
                 msg(M_ERR, "openvpn_execve: unable to fork");
             }
+            else if (flags & S_NOWAITPID)
+            {
+                ret = pid;
+            }
             else /* parent side */
             {
                 if (waitpid(pid, &ret, 0) != pid)
@@ -206,6 +208,11 @@ openvpn_execve_check(const struct argv *a, const struct env_set *es, const unsig
             goto done;
         }
     }
+    else if (flags & S_NOWAITPID && (stat > 0))
+    {
+        ret = stat;
+        goto done;
+    }
     else if (platform_system_ok(stat))
     {
         ret = true;
@@ -252,7 +259,7 @@ openvpn_popen(const struct argv *a,  const struct env_set *es)
                 if (pid == (pid_t)0)       /* child side */
                 {
                     close(pipe_stdout[0]);         /* Close read end */
-                    dup2(pipe_stdout[1],1);
+                    dup2(pipe_stdout[1], 1);
                     execve(cmd, argv, envp);
                     exit(OPENVPN_EXECVE_FAILURE);
                 }
