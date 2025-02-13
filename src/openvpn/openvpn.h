@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2002-2024 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -42,14 +42,13 @@
 #include "sig.h"
 #include "misc.h"
 #include "mbuf.h"
-#include "pf.h"
 #include "pool.h"
 #include "plugin.h"
 #include "manage.h"
 
 /*
  * Our global key schedules, packaged thusly
- * to facilitate --persist-key.
+ * to facilitate key persistence.
  */
 
 struct key_schedule
@@ -66,6 +65,9 @@ struct key_schedule
     /* optional TLS control channel wrapping */
     struct key_type tls_auth_key_type;
     struct key_ctx_bi tls_wrap_key;
+    /** original tls-crypt key preserved to xored into the tls_crypt
+     * renegotiation key */
+    struct key2 original_wrap_keydata;
     struct key_ctx tls_crypt_v2_server_key;
     struct buffer tls_crypt_v2_wkc;             /**< Wrapped client key */
     struct key_ctx auth_token_key;
@@ -152,7 +154,8 @@ struct context_0
  */
 struct context_1
 {
-    struct link_socket_addr link_socket_addr;
+    int link_sockets_num;
+    struct link_socket_addr *link_socket_addrs;
     /**< Local and remote addresses on the
      *   external network. */
 
@@ -198,10 +201,6 @@ struct context_1
     /**< Hash of option strings received from the
      *   remote OpenVPN server.  Only used in
      *   client-mode. */
-
-    struct user_pass *auth_user_pass;
-    /**< Username and password for
-     *   authentication. */
 };
 
 
@@ -235,11 +234,11 @@ struct context_2
     /* bitmask for event status. Check event.h for possible values */
     unsigned int event_set_status;
 
-    struct link_socket *link_socket;     /* socket used for TCP/UDP connection to remote */
+    struct link_socket **link_sockets;
+    struct link_socket_info **link_socket_infos;
+
     bool link_socket_owned;
 
-    /** This variable is used instead link_socket->info for P2MP UDP childs */
-    struct link_socket_info *link_socket_info;
     const struct link_socket *accept_from; /* possibly do accept() on a parent link_socket */
 
     struct link_socket_actual *to_link_addr;    /* IP address of remote */
@@ -247,14 +246,11 @@ struct context_2
 
     /* MTU frame parameters */
     struct frame frame;                         /* Active frame parameters */
-    struct frame frame_initial;                 /* Restored on new session */
 
 #ifdef ENABLE_FRAGMENT
     /* Object to handle advanced MTU negotiation and datagram fragmentation */
     struct fragment_master *fragment;
     struct frame frame_fragment;
-    struct frame frame_fragment_initial;
-    struct frame frame_fragment_omit;
 #endif
 
     /*
@@ -268,8 +264,10 @@ struct context_2
     counter_type tun_read_bytes;
     counter_type tun_write_bytes;
     counter_type link_read_bytes;
+    counter_type dco_read_bytes;
     counter_type link_read_bytes_auth;
     counter_type link_write_bytes;
+    counter_type dco_write_bytes;
 #ifdef PACKET_TRUNCATION_CHECK
     counter_type n_trunc_tun_read;
     counter_type n_trunc_tun_write;
@@ -287,7 +285,12 @@ struct context_2
 
     /* --inactive */
     struct event_timeout inactivity_interval;
-    int inactivity_bytes;
+    int64_t inactivity_bytes;
+
+    struct event_timeout session_interval;
+
+    /* auth token renewal timer */
+    struct event_timeout auth_token_renewal_interval;
 
     /* the option strings must match across peers */
     char *options_string_local;
@@ -330,6 +333,12 @@ struct context_2
      *   on the first connection packet
      *   received from a new client.  See the
      *   \c --tls-auth commandline option. */
+
+
+    hmac_ctx_t *session_id_hmac;
+    /**< the HMAC we use to generate and verify our syn cookie like
+     * session ids from the server.
+     */
 
     /* used to optimize calls to tls_multi_process */
     struct interval tmp_int;
@@ -381,7 +390,9 @@ struct context_2
      * Event loop info
      */
 
-    /* how long to wait on link/tun read before we will need to be serviced */
+    /** Time to next event of timers and similar. This is used to determine
+     *  how long to wait on event wait (select/poll on link/tun read)
+     *  before this context wants to be serviced. */
     struct timeval timeval;
 
     /* next wakeup for processing coarse timers (>1 sec resolution) */
@@ -437,9 +448,6 @@ struct context_2
     int scheduled_exit_signal;
 
     /* packet filter */
-#ifdef ENABLE_PF
-    struct pf_context pf;
-#endif
 
 #ifdef ENABLE_MANAGEMENT
     struct man_def_auth_context mda_context;
@@ -530,10 +538,9 @@ struct context
 #define PROTO_DUMP(buf, gc) protocol_dump((buf), \
                                           PROTO_DUMP_FLAGS   \
                                           |(c->c2.tls_multi ? PD_TLS : 0)   \
-                                          |(c->options.tls_auth_file ? c->c1.ks.key_type.hmac_length : 0), \
+                                          |(c->options.tls_auth_file ? md_kt_size(c->c1.ks.key_type.digest) : 0) \
+                                          |(c->options.tls_crypt_file || c->options.tls_crypt_v2_file ? PD_TLS_CRYPT : 0), \
                                           gc)
-
-#define CIPHER_ENABLED(c) (c->c1.ks.key_type.cipher != NULL)
 
 /* this represents "disabled peer-id" */
 #define MAX_PEER_ID 0xFFFFFF

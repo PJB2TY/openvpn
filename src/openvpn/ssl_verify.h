@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2002-2024 OpenVPN Inc <sales@openvpn.net>
  *  Copyright (C) 2010-2021 Fox Crypto B.V. <openvpn@foxcrypto.com>
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -23,7 +23,8 @@
  */
 
 /**
- * @file Control Channel Verification Module
+ * @file
+ * Control Channel Verification Module
  */
 
 #ifndef SSL_VERIFY_H_
@@ -161,35 +162,6 @@ const char *tls_username(const struct tls_multi *multi, const bool null);
  */
 bool cert_hash_compare(const struct cert_hash_set *chs1, const struct cert_hash_set *chs2);
 
-#ifdef ENABLE_PF
-
-/**
- * Retrieve the given tunnel's common name and its hash value.
- *
- * @param multi         The tunnel to use
- * @param cn            Common name's string
- * @param cn_hash       Common name's hash value
- *
- * @return true if the common name was set, false otherwise.
- */
-static inline bool
-tls_common_name_hash(const struct tls_multi *multi, const char **cn, uint32_t *cn_hash)
-{
-    if (multi)
-    {
-        const struct tls_session *s = &multi->session[TM_ACTIVE];
-        if (s->common_name && s->common_name[0] != '\0')
-        {
-            *cn = s->common_name;
-            *cn_hash = s->common_name_hashval;
-            return true;
-        }
-    }
-    return false;
-}
-
-#endif
-
 /**
  * Verify the given username and password, using either an external script, a
  * plugin, or the management interface.
@@ -205,6 +177,29 @@ tls_common_name_hash(const struct tls_multi *multi, const char **cn, uint32_t *c
  */
 void verify_user_pass(struct user_pass *up, struct tls_multi *multi,
                       struct tls_session *session);
+
+
+
+/**
+ * Runs the --client-crresponse script if one is defined.
+ *
+ * As with the management interface the script is stateless in the sense that
+ * it does not directly participate in the authentication but rather should set
+ * the files for the deferred auth like the management commands.
+ *
+ */
+void
+verify_crresponse_script(struct tls_multi *multi, const char *cr_response);
+
+/**
+ * Call the plugin OPENVPN_PLUGIN_CLIENT_CRRESPONSE.
+ *
+ * As with the management interface calling the plugin is stateless in the sense
+ * that it does not directly participate in the authentication but rather
+ * should set the files for the deferred auth like the management commands.
+ */
+void
+verify_crresponse_plugin(struct tls_multi *multi, const char *cr_response);
 
 /**
  * Perform final authentication checks, including locking of the cn, the allowed
