@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2002-2024 OpenVPN Inc <sales@openvpn.net>
  *  Copyright (C) 2010-2021 Fox Crypto B.V. <openvpn@foxcrypto.com>
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -23,7 +23,8 @@
  */
 
 /**
- * @file Control Channel Common Data Structures
+ * @file
+ * Control Channel Common Data Structures
  */
 
 #ifndef SSL_COMMON_H_
@@ -74,7 +75,10 @@
  *
  * @{
  */
-#define S_ERROR          -1     /**< Error state.  */
+#define S_ERROR         (-2)     /**< Error state.  */
+#define S_ERROR_PRE     (-1)     /**< Error state but try to send out alerts
+                                  *  before killing the keystore and moving
+                                  *  it to S_ERROR */
 #define S_UNDEF           0     /**< Undefined state, used after a \c
                                  *   key_state is cleaned up. */
 #define S_INITIAL         1     /**< Initial \c key_state state after
@@ -95,7 +99,10 @@
                                  *   completed while still within the
                                  *   handshake window.  Deferred auth and
                                  *   client connect can still be pending. */
-#define S_GENERATED_KEYS  7     /**< The data channel keys have been generated */
+#define S_GENERATED_KEYS  7     /**< The data channel keys have been generated
+                                 *  The TLS session is fully authenticated
+                                 *  when reaching this state. */
+
 /* Note that earlier versions also had a S_OP_NORMAL state that was
  * virtually identical with S_ACTIVE and the code still assumes everything
  * >= S_ACTIVE to be fully operational */
@@ -138,20 +145,21 @@ struct key_source2 {
  * Only KS_AUTH_TRUE is fully authenticated
  */
 enum ks_auth_state {
-  KS_AUTH_FALSE,              /**< Key state is not authenticated  */
-  KS_AUTH_DEFERRED,           /**< Key state authentication is being deferred,
-                                * by async auth */
-  KS_AUTH_TRUE                /**< Key state is authenticated. TLS and user/pass
-                                * succeeded. This includes AUTH_PENDING/OOB
-                                * authentication as those hold the
-                                * connection artificially in KS_AUTH_DEFERRED
-                                */
+    KS_AUTH_FALSE,            /**< Key state is not authenticated  */
+    KS_AUTH_DEFERRED,         /**< Key state authentication is being deferred,
+                               * by async auth */
+    KS_AUTH_TRUE              /**< Key state is authenticated. TLS and user/pass
+                               * succeeded. This includes AUTH_PENDING/OOB
+                               * authentication as those hold the
+                               * connection artificially in KS_AUTH_DEFERRED
+                               */
 };
 
 struct auth_deferred_status
 {
     char *auth_control_file;
     char *auth_pending_file;
+    char *auth_failed_reason_file;
     unsigned int auth_control_status;
 };
 
@@ -162,6 +170,12 @@ enum auth_deferred_result {
     ACF_SUCCEEDED,    /**< deferred auth has suceeded */
     ACF_DISABLED,     /**< deferred auth is not used */
     ACF_FAILED        /**< deferred auth has failed */
+};
+
+enum dco_key_status {
+    DCO_NOT_INSTALLED,
+    DCO_INSTALLED_PRIMARY,
+    DCO_INSTALLED_SECONDARY
 };
 
 /**
@@ -186,13 +200,19 @@ struct key_state
 {
     int state;
     /** The state of the auth-token sent from the client */
-    int auth_token_state_flags;
+    unsigned int auth_token_state_flags;
 
     /**
      * Key id for this key_state,  inherited from struct tls_session.
      * @see tls_session::key_id.
      */
     int key_id;
+
+    /**
+     * Key id for this key_state, inherited from struct tls_session.
+     * @see tls_multi::peer_id.
+     */
+    uint32_t peer_id;
 
     struct key_state_ssl ks_ssl; /* contains SSL object and BIOs for the control channel */
 
@@ -217,9 +237,11 @@ struct key_state
     struct reliable *send_reliable; /* holds a copy of outgoing packets until ACK received */
     struct reliable *rec_reliable; /* order incoming ciphertext packets before we pass to TLS */
     struct reliable_ack *rec_ack; /* buffers all packet IDs we want to ACK back to sender */
+    struct reliable_ack *lru_acks; /* keeps the most recently acked packages*/
 
+    /** Holds outgoing message for the control channel until ks->state reaches
+     * S_ACTIVE */
     struct buffer_list *paybuf;
-
     counter_type n_bytes;                /* how many bytes sent/recvd since last key exchange */
     counter_type n_packets;              /* how many packets sent/recvd since last key exchange */
 
@@ -237,6 +259,8 @@ struct key_state
 
     struct auth_deferred_status plugin_auth;
     struct auth_deferred_status script_auth;
+
+    enum dco_key_status dco_status;
 };
 
 /** Control channel wrapping (--tls-auth/--tls-crypt) context */
@@ -255,6 +279,15 @@ struct tls_wrap_ctx
     struct buffer tls_crypt_v2_metadata;     /**< Received from client */
     bool cleanup_key_ctx;                    /**< opt.key_ctx_bi is owned by
                                               *   this context */
+    /** original key data to be xored in to the key for dynamic tls-crypt.
+     *
+     * We keep the original key data to ensure that the newly generated key
+     * for the dynamic tls-crypt has the same level of quality by using
+     * xor with the original key. This gives us the same same entropy/randomness
+     * as the original tls-crypt key to ensure the post-quantum use case of
+     * tls-crypt still holds true
+     * */
+    struct key2 original_wrap_keydata;
 };
 
 /*
@@ -281,22 +314,32 @@ struct tls_options
     const char *remote_options;
 
     /* from command line */
-    bool replay;
     bool single_session;
-    bool disable_occ;
     int mode;
     bool pull;
+    /**
+     * The detail of info we push in peer info
+     *
+     * 0 - nothing at all, P2MP server only
+     * 1 - only the most basic information to negotiate cipher and features
+     *     for P2P NCP
+     * 2 - normal setting for clients
+     * 3 - full information including "sensitive data" like IV_HWADDR
+     *     enabled by --push-peer-info
+     */
     int push_peer_info_detail;
     int transition_window;
     int handshake_window;
     interval_t packet_timeout;
-    int renegotiate_bytes;
-    int renegotiate_packets;
+    int64_t renegotiate_bytes;
+    int64_t renegotiate_packets;
+    /** limit for AEAD cipher when not running in epoch data key mode,
+     *  this is the sum of packets + blocks that are allowed to be used */
+    uint64_t aead_usage_limit;
     interval_t renegotiate_seconds;
 
     /* cert verification parms */
     const char *verify_command;
-    const char *verify_export_cert;
     int verify_x509_type;
     const char *verify_x509_name;
     const char *crl_file;
@@ -323,7 +366,12 @@ struct tls_options
 
     const char *config_ciphername;
     const char *config_ncp_ciphers;
-    bool ncp_enabled;
+
+    /** whether our underlying data channel supports new data channel
+     * features (epoch keys with AEAD tag at the end). This is always true
+     * for the internal implementation but can be false for DCO
+     * implementations */
+    bool data_epoch_supported;
 
     bool tls_crypt_v2;
     const char *tls_crypt_v2_verify_script;
@@ -335,15 +383,19 @@ struct tls_options
 
     /* used for username/password authentication */
     const char *auth_user_pass_verify_script;
+    const char *client_crresponse_script;
     bool auth_user_pass_verify_script_via_file;
     const char *tmp_dir;
+    const char *export_peer_cert_dir;
     const char *auth_user_pass_file;
+    bool auth_user_pass_file_inline;
 
     bool auth_token_generate;   /**< Generate auth-tokens on successful
                                  * user/pass auth,seet via
                                  * options->auth_token_generate. */
     bool auth_token_call_auth; /**< always call normal authentication */
     unsigned int auth_token_lifetime;
+    unsigned int auth_token_renewal;
 
     struct key_ctx auth_token_key;
 
@@ -391,6 +443,8 @@ struct tls_options
     const char *ekm_label;
     size_t ekm_label_size;
     size_t ekm_size;
+
+    bool dco_enabled; /**< Whether keys have to be installed in DCO or not */
 };
 
 /** @addtogroup control_processor
@@ -434,6 +488,10 @@ struct tls_session
     /* authenticate control packets */
     struct tls_wrap_ctx tls_wrap;
 
+    /* Specific tls-crypt for renegotiations, if this is valid,
+     * tls_wrap_reneg.mode is TLS_WRAP_CRYPT, otherwise ignore it */
+    struct tls_wrap_ctx tls_wrap_reneg;
+
     int initial_opcode;         /* our initial P_ opcode */
     struct session_id session_id; /* our random session ID */
 
@@ -444,17 +502,11 @@ struct tls_session
      */
     int key_id;
 
-    int limit_next;             /* used for traffic shaping on the control channel */
-
     int verify_maxlevel;
 
     char *common_name;
 
     struct cert_hash_set *cert_hash_set;
-
-#ifdef ENABLE_PF
-    uint32_t common_name_hashval;
-#endif
 
     bool verified;              /* true if peer certificate was verified against CA */
 
@@ -482,7 +534,7 @@ struct tls_session
  *
  *  @{ */
 #define TM_ACTIVE    0          /**< Active \c tls_session. */
-#define TM_UNTRUSTED 1          /**< As yet un-trusted \c tls_session
+#define TM_INITIAL   1          /**< As yet un-trusted \c tls_session
                                  *   being negotiated. */
 #define TM_LAME_DUCK 2          /**< Old \c tls_session. */
 #define TM_SIZE      3          /**< Size of the \c tls_multi.session
@@ -504,9 +556,10 @@ struct tls_session
 #define KEY_SCAN_SIZE 3
 
 
-/* client authentication state, CAS_SUCCEEDED must be 0 since
- * non multi code path still checks this variable but does not initialise it
- * so the code depends on zero initialisation */
+/* multi state (originally client authentication state (=CAS))
+ * CAS_NOT_CONNECTED must be 0 since non multi code paths still check
+ * this variable but do not explicitly initialise it and depend
+ * on zero initialisation */
 
 /* CAS_NOT_CONNECTED is the initial state for every context. When the *first*
  * tls_session reaches S_ACTIVE, this state machine moves to CAS_PENDING (server)
@@ -514,12 +567,16 @@ struct tls_session
  * connect scripts/plugins */
 enum multi_status {
     CAS_NOT_CONNECTED,
-    CAS_WAITING_AUTH,               /**< TLS connection established but deferred auth not finished */
-    CAS_PENDING,
-    CAS_PENDING_DEFERRED,
-    CAS_PENDING_DEFERRED_PARTIAL,   /**< at least handler succeeded, no result yet*/
-    CAS_FAILED,
+    CAS_WAITING_AUTH,               /**< Initial TLS connection established but deferred auth is not yet finished */
+    CAS_PENDING,                    /**< Options import (Connect script/plugin, ccd,...) */
+    CAS_PENDING_DEFERRED,           /**< Waiting on an async option import handler */
+    CAS_PENDING_DEFERRED_PARTIAL,   /**< at least handler succeeded but another is still pending */
+    CAS_FAILED,                     /**< Option import failed or explicitly denied the client */
     CAS_WAITING_OPTIONS_IMPORT,     /**< client with pull or p2p waiting for first time options import */
+    CAS_RECONNECT_PENDING,          /**< session has already successful established (CAS_CONNECT_DONE)
+                                     * but has a reconnect and needs to redo some initialisation, this state is
+                                     * similar CAS_WAITING_OPTIONS_IMPORT but skips a few things. The normal connection
+                                     * skips this step. */
     CAS_CONNECT_DONE,
 };
 
@@ -596,8 +653,8 @@ struct tls_multi
                           *   user/pass authentications in this session.
                           */
     char *auth_token_initial;
-    /**< The first auth-token we sent to a client, for clients that do
-     * not update their auth-token (older OpenVPN3 core versions)
+    /**< The first auth-token we sent to a client. We use this to remember
+     * the session ID and initial timestamp when generating new auth-token.
      */
 #define  AUTH_TOKEN_HMAC_OK              (1<<0)
     /**< Auth-token sent from client has valid hmac */
@@ -626,6 +683,20 @@ struct tls_multi
     /**< Array of \c tls_session objects
      *   representing control channel
      *   sessions with the remote peer. */
+
+    /* Only used when DCO is used to remember how many keys we installed
+     * for this session */
+    int dco_keys_installed;
+    /**
+     * This is the handle that DCO uses to identify this session with the
+     * kernel.
+     *
+     * We keep this separate as the normal peer_id can change during
+     * p2p NCP and we need to track the id that is really used.
+     */
+    int dco_peer_id;
+
+    dco_context_t *dco;
 };
 
 /**  gets an item  of \c key_state objects in the
@@ -638,10 +709,13 @@ get_key_scan(struct tls_multi *multi, int index)
     {
         case 0:
             return &multi->session[TM_ACTIVE].key[KS_PRIMARY];
+
         case 1:
             return &multi->session[TM_ACTIVE].key[KS_LAME_DUCK];
+
         case 2:
             return &multi->session[TM_LAME_DUCK].key[KS_LAME_DUCK];
+
         default:
             ASSERT(false);
             return NULL; /* NOTREACHED */
@@ -654,7 +728,7 @@ get_key_scan(struct tls_multi *multi, int index)
 static inline const struct key_state *
 get_primary_key(const struct tls_multi *multi)
 {
-        return &multi->session[TM_ACTIVE].key[KS_PRIMARY];
+    return &multi->session[TM_ACTIVE].key[KS_PRIMARY];
 }
 
 #endif /* SSL_COMMON_H_ */
